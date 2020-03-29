@@ -1000,7 +1000,7 @@ static void bitbang_verify_data(adapter_t *adapter,
  * Return a pointer to a data structure, allocated dynamically.
  * When adapter not found, return 0.
  */
-adapter_t *adapter_open_bitbang(const char *port, int baud_rate)
+adapter_t *adapter_open_bitbang(const char *port, int baud_rate, int interface, int speed)
 {
     bitbang_adapter_t *a;
 

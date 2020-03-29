@@ -550,7 +550,7 @@ static void stk_program_block(adapter_t *adapter,
     flush_write_buffer(a);
 }
 
-adapter_t *adapter_open_stk500v2(const char *port, int baud_rate)
+adapter_t *adapter_open_stk500v2(const char *port, int baud_rate, int interface, int speed)
 {
     stk_adapter_t *a;
 

@@ -41,7 +41,7 @@ endif
 PROG_OBJS       = pic32prog.o target.o executive.o serial.o \
                   adapter-pickit2.o adapter-hidboot.o adapter-an1388.o \
                   adapter-bitbang.o adapter-stk500v2.o adapter-uhb.o \
-                  adapter-an1388-uart.o configure.o \
+                  adapter-an1388-uart.o adapter-neofoxx.o configure.o \
                   family-mx1.o family-mx3.o family-mz.o family-mm.o family-mk.o $(HIDLIB)
 
 # JTAG adapters based on FT2232 chip
@@ -74,6 +74,9 @@ pic32prog-ru-cp866.mo ru/LC_MESSAGES/pic32prog.mo: pic32prog-ru.po
 		iconv -f utf-8 -t cp866 $< | sed 's/UTF-8/CP866/' | msgfmt -c -o $@ -
 		cp pic32prog-ru-cp866.mo ru/LC_MESSAGES/pic32prog.mo
 
+cleanpart:
+		rm -f adapter-neofoxx.o
+
 clean:
 		rm -f *~ *.o core pic32prog adapter-mpsse pic32prog.po hidapi/ar-lib hidapi/compile
 		if [ -f hidapi/Makefile ]; then make -C hidapi clean; fi
@@ -101,6 +104,7 @@ adapter-pickit2.o: adapter-pickit2.c adapter.h hidapi/hidapi/hidapi.h pickit2.h 
   pic32.h
 adapter-stk500v2.o: adapter-stk500v2.c adapter.h pic32.h serial.h
 adapter-uhb.o: adapter-uhb.c adapter.h hidapi/hidapi/hidapi.h pic32.h
+adapter-neofoxx.o: adapter-neofoxx.c adapter.h pic32.h serial.h
 configure.o: configure.c target.h adapter.h
 executive.o: executive.c pic32.h
 family-mx1.o: family-mx1.c pic32.h

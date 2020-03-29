@@ -357,7 +357,7 @@ static void an1388_erase_chip(adapter_t *adapter)
     }
 }
 
-adapter_t *adapter_open_an1388_uart(const char *port, int baud_rate)
+adapter_t *adapter_open_an1388_uart(const char *port, int baud_rate, int interface, int speed)
 {
     an1388_adapter_t *a;
 

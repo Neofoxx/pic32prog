@@ -56,10 +56,11 @@ adapter_t *adapter_open_pickit3(int vid, int pid, const char *serial);
 adapter_t *adapter_open_an1388(int vid, int pid, const char *serial);
 adapter_t *adapter_open_hidboot(int vid, int pid, const char *serial);
 adapter_t *adapter_open_mpsse(int vid, int pid, const char *serial, int interface, int speed);
-adapter_t *adapter_open_bitbang(const char *port, int baud_rate);
-adapter_t *adapter_open_an1388_uart(const char *port, int baud_rate);
-adapter_t *adapter_open_stk500v2(const char *port, int baud_rate);
+adapter_t *adapter_open_bitbang(const char *port, int baud_rate, int interface, int speed);
+adapter_t *adapter_open_an1388_uart(const char *port, int baud_rate, int interface, int speed);
+adapter_t *adapter_open_stk500v2(const char *port, int baud_rate, int interface, int speed);
 adapter_t *adapter_open_uhb(int vid, int pid, const char *serial);
+adapter_t *adapter_open_neofoxx(const char *port, int baud_rate, int interface, int speed);
 
 void mdelay(unsigned msec);
 extern int debug_level;

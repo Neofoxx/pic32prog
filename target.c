@@ -313,11 +313,12 @@ static variant_t pic32_tab[TABSZ] = {
  */
 static const struct {
     const char *prefix;
-    adapter_t *(*func)(const char *port, int baud);
+    adapter_t *(*func)(const char *port, int baud, int interface, int speed);
 } serial_tab[] = {
     { "stk500",     adapter_open_stk500v2       },  /* Default */
     { "an1388",     adapter_open_an1388_uart    },
     { "ascii",      adapter_open_bitbang        },
+    { "neofoxx",    adapter_open_neofoxx        },
     { 0 },
 };
 
@@ -454,15 +455,15 @@ static adapter_t *open_serial_adapter(const char *port_name, int baud_rate,
     int prefix_len, len, i;
 
 	if (INTERFACE_DEFAULT != interface){
-		fprintf(stderr, "Non-default interface currently not-supported on \
-						serial adapters, ingoring specified interface\n");
+		//fprintf(stderr, "Non-default interface currently not-supported on \
+		//				serial adapters, ingoring specified interface\n");
 	}
 
     /* Get protocol prefix. */
     delimiter = strchr(port_name, ':');
     if (! delimiter) {
         /* Use stk500v2 protocol by default. */
-        return serial_tab[0].func(port_name, baud_rate);
+        return serial_tab[0].func(port_name, baud_rate, 0, 0);	// TODO FIX
     }
     prefix_len = delimiter - port_name;
     prefix = port_name;
@@ -473,7 +474,7 @@ static adapter_t *open_serial_adapter(const char *port_name, int baud_rate,
         len = strlen(serial_tab[i].prefix);
         if (prefix_len == len &&
             strncasecmp(prefix, serial_tab[i].prefix, len) == 0) {
-            return serial_tab[i].func(port_name, baud_rate);
+            return serial_tab[i].func(port_name, baud_rate, interface, speed); // TODO FIX
         }
     }
     return 0;
