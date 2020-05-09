@@ -25,18 +25,17 @@
 #include "pic32.h"
 #include "serial.h"
 
-
 typedef struct {
     // Common part
     adapter_t adapter;
 	char name [64];	// Make const char * again later or something.	
 
     // Transmit buffer
-    uint8_t output [256];
+    uint8_t output [2048];
     int bytes_to_write;
 
     // Receive buffer.
-    uint8_t input [256]; 
+    uint8_t input [2048]; 
     int bytes_to_read;
 	int bytes_in_buffer;
 	int current_pos_input;
@@ -45,11 +44,13 @@ typedef struct {
 	unsigned interface;	// Remove later?
     uint32_t use_executive;
     uint32_t serial_execution_mode;
+	uint32_t way;	// old or new
 
 	// These should be int8_t, 'cos chars.
 	uint8_t capabilities_mcu[64];
 	uint8_t capabilities_version_fw[64];
 	uint8_t capabilities_version_hw[64];
+
 
 } neofoxx_adapter_t;
 
@@ -84,6 +85,7 @@ typedef struct {
 #define COMMAND_SET_PIN_WRITE	4	// Write to pin
 #define COMMAND_SET_PIN_READ	5	// Read pin value
 #define COMMAND_SEND			6	// Send command
+#define COMMAND_XFER_INSTRUCTION	7	// xferInstruction, but performed on MCU
 
 #define PROG_MODE_TRISTATE	0
 #define PROG_MODE_JTAG		1
@@ -105,7 +107,9 @@ typedef struct {
 #define PIN_SET_OUTPUT_HIGH	1
 #define PIN_SET_INPUT		2
 
-
+// For benchmarking old vs. new way.
+#define WAY_OLD	0
+#define WAY_NEW 1
 
 
 /*
@@ -221,8 +225,9 @@ static void neofoxx_flush_output(neofoxx_adapter_t *a)
 {
     int32_t bytes_read;
 
-    if (a->bytes_to_write <= 0)
+    if (a->bytes_to_write <= 0){
         return;
+	}
 
 	// Write what we have to write
     bulk_write(a, a->output, a->bytes_to_write);
@@ -407,6 +412,7 @@ static uint64_t neofoxx_recv(neofoxx_adapter_t *a){
     neofoxx_flush_output(a);
 
 	uint32_t i;
+
 /*
 	fprintf(stderr, "In _recv\n");
 	for (i=0; i<a->bytes_in_buffer; i++){
@@ -521,7 +527,11 @@ static uint64_t neofoxx_xferData(neofoxx_adapter_t *a, uint32_t nBits,
     return 0;
 }
 
-static uint64_t neofoxx_xferFastData(neofoxx_adapter_t *a, unsigned word, uint32_t readFlag, uint32_t immediate)
+// In the PC_slow implementation, immediate is implied 
+// (we get PrACC, even though we more or less ignore it :p).
+// We could receive at the end and check the result?
+// Hm... better not, maintain same functionality, make MCU_fast do that.
+static uint64_t neofoxx_xferFastData_PC_slow(neofoxx_adapter_t *a, unsigned word, uint32_t readFlag)
 {
     uint64_t temp;
     neofoxx_send(a, TMS_HEADER_XFERDATAFAST_NBITS, TMS_HEADER_XFERDATAFAST_VAL,
@@ -538,13 +548,31 @@ static uint64_t neofoxx_xferFastData(neofoxx_adapter_t *a, unsigned word, uint32
     return 0;
 }
 
-static void neofoxx_xferInstruction(neofoxx_adapter_t *a, unsigned instruction)
+// In the MCU_fast implementation, this will execute on the programmer
+// This means we can queue these instructions, and save on the bandwidth :)
+// Also function is now void, you are responsible for popping bytes off of it.
+static void neofoxx_xferFastData_MCU_fast(neofoxx_adapter_t *a, unsigned word, uint32_t readFlag){
+	neofoxx_send(a, TMS_HEADER_XFERDATAFAST_NBITS, TMS_HEADER_XFERDATAFAST_VAL,
+                    33, (unsigned long long) word << 1,
+                    TMS_FOOTER_XFERDATAFAST_NBITS, TMS_FOOTER_XFERDATAFAST_VAL,
+                    readFlag);
+	
+	// Err, that's not right, is it?
+	// Oh, yes it is, just get the data from recv_ and readout the PrACC. Derp.
+	
+}
+
+
+// In the PC_slow implementation, immediate is implied, 
+// since it needs to pass data back and fort (CONTROL_PROBEN).
+// This means that we can't really queue these instructions == no speedup == slow.
+static void neofoxx_xferInstruction_PC_slow(neofoxx_adapter_t *a, uint32_t instruction)
 {
     unsigned ctl;
     unsigned maxCounter = 0;
 
     if (debug_level > 1){
-        fprintf(stderr, "%s: xfer instruction %08x\n", a->name, instruction);
+        fprintf(stderr, "%s: xfer instruction PC_slow %08x\n", a->name, instruction);
 	}
 
     /* Select Control Register */
@@ -581,13 +609,32 @@ static void neofoxx_xferInstruction(neofoxx_adapter_t *a, unsigned instruction)
     neofoxx_xferData(a, 32, (CONTROL_PROBEN | CONTROL_PROBTRAP), 0, 1);   // Send data, no readback, immediate
 }
 
+// In the MCU_fast implementation, this will execute on the programmer
+// This means we can queue these instructions, and save on the bandwidth :)
+static void neofoxx_xferInstruction_MCU_fast(neofoxx_adapter_t *a, uint32_t instruction){
+	if (debug_level > 1){
+        fprintf(stderr, "%s: xfer instruction MCU_fast %08x\n", a->name, instruction);
+	}
+
+	uint8_t data[64];
+	uint32_t nbytes = 0;
+	data[nbytes++] = COMMAND_XFER_INSTRUCTION;
+	memcpy(&(data[nbytes]), &instruction, sizeof(instruction));
+	nbytes = nbytes + sizeof(instruction);
+	add_to_packet(a, data, nbytes);
+
+	// Also read 4B of response.
+	// 0 is success, MSB set is FAIL
+	a->bytes_to_read = a->bytes_to_read + sizeof(uint32_t);	// Important!
+}
+
 static void neofoxx_speed(neofoxx_adapter_t *a, int khz)
 {
-	fprintf(stderr, "Function not implemented yet\n"); 
+	fprintf(stderr, "Function %s not implemented yet\n", __func__); 
 	
 	// Todo, if at all
 	// For some devices, speed will be variable (in khz/divisor steps).
-	// For some (bitbangers) there'll be just fast/maybe medium/slow.
+	// For some (bitbangers) there'll be just fast/maybe medium/slow. Maybe.
 }
 
 static void neofoxx_close(adapter_t *adapter, int power_on)
@@ -828,56 +875,68 @@ static unsigned neofoxx_read_word(adapter_t *adapter, unsigned addr)
     unsigned addr_hi = (addr >> 16) & 0xFFFF;
     unsigned word = 0;
 
+	uint32_t workaround = 1;
+
     /* Workaround for PIC32MM. If not in serial execution mode yet,
      * read word twice after enering serial execution,
      * as first word will be garbage. */
     unsigned times = (a->serial_execution_mode)?0:1;
 
     serial_execution(a);
-    do{
-        if (FAMILY_MX1 == a->adapter.family_name_short
-                        || FAMILY_MX3 == a->adapter.family_name_short
-                        || FAMILY_MK == a->adapter.family_name_short
-                        || FAMILY_MZ == a->adapter.family_name_short)
-        {
-            //fprintf(stderr, "%s: read word from %08x\n", a->name, addr);
+	if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
 
-            neofoxx_xferInstruction(a, 0x3c13ff20);            // lui s3, FASTDATA_REG_ADDR(31:16)
-            neofoxx_xferInstruction(a, 0x3c080000 | addr_hi);  // lui t0, addr_hi
-            neofoxx_xferInstruction(a, 0x35080000 | addr_lo);  // ori t0, addr_lo
-            neofoxx_xferInstruction(a, 0x8d090000);            // lw t1, 0(t0)
-            neofoxx_xferInstruction(a, 0xae690000);            // sw t1, 0(s3)
-            neofoxx_xferInstruction(a, 0);                     // NOP - necessary!
+		do{
+		    if (FAMILY_MX1 == a->adapter.family_name_short
+		                    || FAMILY_MX3 == a->adapter.family_name_short
+		                    || FAMILY_MK == a->adapter.family_name_short
+		                    || FAMILY_MZ == a->adapter.family_name_short)
+		    {
+		        //fprintf(stderr, "%s: read word from %08x\n", a->name, addr);
 
-            /* Send command. */
-            neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
-            /* Get fastdata. */    
-            /* Send zeroes, read response, immediate don't care. Shift by 1 to get rid of PrACC */
-            word = neofoxx_xferFastData(a, 0, 1, 1) >> 1;
-        }
-        else{
-            /* Else PIC32MM */
-			neofoxx_xferInstruction(a, 0xFF2041B3);					// lui s3, FAST_DATA_REG(32:16). Set address of fastdata register
-			neofoxx_xferInstruction(a, 0x000041A8 | (addr_hi<<16));	// lui t0, DATA_ADDRESS(31:16)
-			neofoxx_xferInstruction(a, 0x00005108 | (addr_lo<<16));	// ori t0, DATA_ADDRESS(15:0)
-	 		neofoxx_xferInstruction(a, 0x0000FD28);					// lw t1, 0(t0) - read data
-	 		neofoxx_xferInstruction(a, 0x0000F933);					// sw t1, 0(s3) - store data to fast register
-			neofoxx_xferInstruction(a, 0x0c000c00);					// Nop, 2x
-			neofoxx_xferInstruction(a, 0x0c000c00);					// Nop, 2x, again. Without this (4x nop), you will get garbage after a few bytes!
-																	// Extra Nops make it even worse, always get 0s
-	 		
-			/* Send command. */
-			neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+		        neofoxx_xferInstruction_PC_slow(a, 0x3c13ff20);            // lui s3, FASTDATA_REG_ADDR(31:16)
+		        neofoxx_xferInstruction_PC_slow(a, 0x3c080000 | addr_hi);  // lui t0, addr_hi
+		        neofoxx_xferInstruction_PC_slow(a, 0x35080000 | addr_lo);  // ori t0, addr_lo
+		        neofoxx_xferInstruction_PC_slow(a, 0x8d090000);            // lw t1, 0(t0)
+		        neofoxx_xferInstruction_PC_slow(a, 0xae690000);            // sw t1, 0(s3)
+		        neofoxx_xferInstruction_PC_slow(a, 0);                     // NOP - necessary!
 
-			/* Get fastdata. */
-			word = neofoxx_xferFastData(a, 0, 1, 1) >> 1; // Send zeroes, read response, immediate don't care. Shift by 1 to get rid of PrACC
-        }
+		        /* Send command. */
+		        neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+		        /* Get fastdata. */    
+		        /* Send zeroes, read response, immediate don't care. Shift by 1 to get rid of PrACC */
+		        word = neofoxx_xferFastData_PC_slow(a, 0, 1) >> 1;
+		    }
+		    else{
+		        /* Else PIC32MM */
+				neofoxx_xferInstruction_PC_slow(a, 0xFF2041B3);					// lui s3, FAST_DATA_REG(32:16). Set address of fastdata register
+				neofoxx_xferInstruction_PC_slow(a, 0x000041A8 | (addr_hi<<16));	// lui t0, DATA_ADDRESS(31:16)
+				neofoxx_xferInstruction_PC_slow(a, 0x00005108 | (addr_lo<<16));	// ori t0, DATA_ADDRESS(15:0)
+		 		neofoxx_xferInstruction_PC_slow(a, 0x0000FD28);					// lw t1, 0(t0) - read data
+		 		neofoxx_xferInstruction_PC_slow(a, 0x0000F933);					// sw t1, 0(s3) - store data to fast register
+				neofoxx_xferInstruction_PC_slow(a, 0x0c000c00);					// Nop, 2x
+				neofoxx_xferInstruction_PC_slow(a, 0x0c000c00);					// Nop, 2x, again. Without this (4x nop), you will get garbage after a few bytes!
+																		// Extra Nops make it even worse, always get 0s
+		 		
+				/* Send command. */
+				neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
 
-    }while(times-- > 0);
+				/* Get fastdata. */
+				word = neofoxx_xferFastData_PC_slow(a, 0, 1) >> 1; // Send zeroes, read response, immediate don't care. Shift by 1 to get rid of PrACC
+		    }
 
-    if (debug_level > 0)
-        fprintf(stderr, "%s: read word at %08x -> %08x\n", a->name, addr, word);
-    return word;
+		}while(times-- > 0);
+
+		if (debug_level > 0)
+		    fprintf(stderr, "%s: read word at %08x -> %08x\n", a->name, addr, word);
+		return word;
+	}
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+		return 0;
+	}
 }
 
 /*
@@ -889,34 +948,43 @@ static void neofoxx_read_data(adapter_t *adapter,
     neofoxx_adapter_t *a = (neofoxx_adapter_t*) adapter;
     unsigned words_read, i;
 
-    //fprintf(stderr, "%s: read %d bytes from %08x\n", a->name, nwords*4, addr);
-    if (! a->use_executive) {
-        /* Without PE. */
-        for (; nwords > 0; nwords--) {
-            *data++ = neofoxx_read_word(adapter, addr);
-            addr += 4;
-        }
-        return;
-    }
+	uint32_t workaround = 1;
 
-    /* Use PE to read memory. */
-    for (words_read = 0; words_read < nwords; words_read += 32) {
+    if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
+		if (! a->use_executive) {
+		    /* Without PE. */
+		    for (; nwords > 0; nwords--) {
+		        *data++ = neofoxx_read_word(adapter, addr);
+		        addr += 4;
+		    }
+		    return;
+		}
 
-        neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
-        neofoxx_xferFastData(a, PE_READ << 16 | 32, 0, 1);       /* Read 32 words */  // Data, don't read, immediate
-        neofoxx_xferFastData(a, addr, 0, 1);                     /* Address */        // Data, don't read, immediate
+		/* Use PE to read memory. */
+		for (words_read = 0; words_read < nwords; words_read += 32) {
 
-        unsigned response = get_pe_response(a);     /* Get response */
-        if (response != PE_READ << 16) {
-            fprintf(stderr, "%s: bad READ response = %08x, expected %08x\n",
-                a->name, response, PE_READ << 16);
-            exit(-1);
-        }
-        for (i=0; i<32; i++) {
-            *data++ = get_pe_response(a);           /* Get data */
-        }
-        addr += 32*4;
-    }
+		    neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+		    neofoxx_xferFastData_PC_slow(a, PE_READ << 16 | 32, 0);       /* Read 32 words */  // Data, don't read, immediate
+		    neofoxx_xferFastData_PC_slow(a, addr, 0);                     /* Address */        // Data, don't read, immediate
+
+		    unsigned response = get_pe_response(a);     /* Get response */
+		    if (response != PE_READ << 16) {
+		        fprintf(stderr, "%s: bad READ response = %08x, expected %08x\n",
+		            a->name, response, PE_READ << 16);
+		        exit(-1);
+		    }
+		    for (i=0; i<32; i++) {
+		        *data++ = get_pe_response(a);           /* Get data */
+		    }
+		    addr += 32*4;
+		}
+	}
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+	}
 }
 
 /*
@@ -927,156 +995,167 @@ static void neofoxx_load_executive(adapter_t *adapter,
 {
     neofoxx_adapter_t *a = (neofoxx_adapter_t*) adapter;
 
+	uint32_t workaround = 1;
+
     a->use_executive = 1;
     serial_execution(a);
 
-    if (debug_level > 0)
+    if (debug_level > 0){
         fprintf(stderr, "%s: download PE loader\n", a->name);
+	}
 
-    if (a->adapter.family_name_short == FAMILY_MX1
-        || a->adapter.family_name_short == FAMILY_MX3
-        || a->adapter.family_name_short == FAMILY_MK
-        || a->adapter.family_name_short == FAMILY_MZ)
-    {
-        /* Step 1. */
-        neofoxx_xferInstruction(a, 0x3c04bf88);    // lui a0, 0xbf88
-        neofoxx_xferInstruction(a, 0x34842000);    // ori a0, 0x2000 - address of BMXCON
-        neofoxx_xferInstruction(a, 0x3c05001f);    // lui a1, 0x1f
-        neofoxx_xferInstruction(a, 0x34a50040);    // ori a1, 0x40   - a1 has 001f0040
-        neofoxx_xferInstruction(a, 0xac850000);    // sw  a1, 0(a0)  - BMXCON initialized
-
-        /* Step 2. */
-        neofoxx_xferInstruction(a, 0x34050800);    // li  a1, 0x800  - a1 has 00000800
-        neofoxx_xferInstruction(a, 0xac850010);    // sw  a1, 16(a0) - BMXDKPBA initialized
-
-        /* Step 3. */
-        neofoxx_xferInstruction(a, 0x8c850040);    // lw  a1, 64(a0) - load BMXDMSZ
-        neofoxx_xferInstruction(a, 0xac850020);    // sw  a1, 32(a0) - BMXDUDBA initialized
-        neofoxx_xferInstruction(a, 0xac850030);    // sw  a1, 48(a0) - BMXDUPBA initialized
-
-        /* Step 4. */
-        neofoxx_xferInstruction(a, 0x3c04a000);    // lui a0, 0xa000
-        neofoxx_xferInstruction(a, 0x34840800);    // ori a0, 0x800  - a0 has a0000800
-
-        /* Download the PE loader. */
-        int i;
-        for (i=0; i<PIC32_PE_LOADER_LEN; i+=2) {
-            /* Step 5. */
-            unsigned opcode1 = 0x3c060000 | pic32_pe_loader[i];
-            unsigned opcode2 = 0x34c60000 | pic32_pe_loader[i+1];
-
-            neofoxx_xferInstruction(a, opcode1);       // lui a2, PE_loader_hi++
-            neofoxx_xferInstruction(a, opcode2);       // ori a2, PE_loader_lo++
-            neofoxx_xferInstruction(a, 0xac860000);    // sw  a2, 0(a0)
-            neofoxx_xferInstruction(a, 0x24840004);    // addiu a0, 4
-        }
-
-        /* Jump to PE loader (step 6). */
-        neofoxx_xferInstruction(a, 0x3c19a000);    // lui t9, 0xa000
-        neofoxx_xferInstruction(a, 0x37390800);    // ori t9, 0x800  - t9 has a0000800
-        neofoxx_xferInstruction(a, 0x03200008);    // jr  t9
-        neofoxx_xferInstruction(a, 0x00000000);    // nop
-
-        /* Switch from serial to fast execution mode. */
-        neofoxx_sendCommand(a, TAP_SW_ETAP, 1);
-        /* TMS 1-1-1-1-1-0 */
-        neofoxx_setMode(a, SET_MODE_TAP_RESET, 1);
-
-        /* Send parameters for the loader (step 7-A).
-         * PE_ADDRESS = 0xA000_0900,
-         * PE_SIZE */
-        /* Send command. */
-        neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
-        neofoxx_xferFastData(a, 0xa0000900, 0, 1);    /* Don't read, immediate */
-        neofoxx_xferFastData(a, nwords, 0, 1);        /* Don't read, immediate */
-
-        /* Download the PE itself (step 7-B). */
-        if (debug_level > 0)
-            fprintf(stderr, "%s: download PE\n", a->name);
-        for (i=0; i<nwords; i++) {
-            neofoxx_xferFastData(a, *pe++, 0, 0);     /* Don't read, not immediate */
-        }
-        neofoxx_flush_output(a);
-        mdelay(10);
-
-        /* Download the PE instructions. */
-        /* Step 8 - jump to PE. */
-        neofoxx_xferFastData(a, 0, 0, 1);             /* Don't read, immediate */                  
-        neofoxx_xferFastData(a, 0xDEAD0000, 0, 1);    /* Don't read, immediate */
-        mdelay(10);
-        neofoxx_xferFastData(a, PE_EXEC_VERSION << 16, 0, 1); /* Don't read, immediate */
-    }
-    else{
-        /* Else MM family */
-        // Step 1. Setup PIC32MM RAM address for the PE 
-		neofoxx_xferInstruction(a, 0xa00041a4);    // lui a0, 0xa000
-		neofoxx_xferInstruction(a, 0x02005084);    // ori a0, a0, 0x200 A total of 0xa000_0200
-
-		// Step 2. Load the PE_loader.
-		int i;
-		for (i=0; i<PIC32_PEMM_LOADER_LEN; i+=2) {
-		    /* Step 5. */
-		    unsigned opcode1 = 0x41A6 | (pic32_pemm_loader[i] << 16);
-		    unsigned opcode2 = 0x50C6 | (pic32_pemm_loader[i+1] << 16);
-
-		    neofoxx_xferInstruction(a, opcode1);       // lui a2, PE_loader_hi++
-		    neofoxx_xferInstruction(a, opcode2);       // ori a2, a2, PE_loader_lo++
-		    neofoxx_xferInstruction(a, 0x6E42EB40);    // sw  a2, 0(a0); addiu a0, a0, 4;
+    if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
 		}
+		if (a->adapter.family_name_short == FAMILY_MX1
+		    || a->adapter.family_name_short == FAMILY_MX3
+		    || a->adapter.family_name_short == FAMILY_MK
+		    || a->adapter.family_name_short == FAMILY_MZ)
+		{
+		    /* Step 1. */
+		    neofoxx_xferInstruction_PC_slow(a, 0x3c04bf88);    // lui a0, 0xbf88
+		    neofoxx_xferInstruction_PC_slow(a, 0x34842000);    // ori a0, 0x2000 - address of BMXCON
+		    neofoxx_xferInstruction_PC_slow(a, 0x3c05001f);    // lui a1, 0x1f
+		    neofoxx_xferInstruction_PC_slow(a, 0x34a50040);    // ori a1, 0x40   - a1 has 001f0040
+		    neofoxx_xferInstruction_PC_slow(a, 0xac850000);    // sw  a1, 0(a0)  - BMXCON initialized
 
-		// Step 3. Jump to the PE_Loader
-		neofoxx_xferInstruction(a, 0xA00041B9);       // lui t9, 0xa000
-		neofoxx_xferInstruction(a, 0x02015339);       // ori t9, t9, 0x0800. Same address as at beginning +1.
-		neofoxx_xferInstruction(a, 0x0C004599);       // jr t9; nop;
+		    /* Step 2. */
+		    neofoxx_xferInstruction_PC_slow(a, 0x34050800);    // li  a1, 0x800  - a1 has 00000800
+		    neofoxx_xferInstruction_PC_slow(a, 0xac850010);    // sw  a1, 16(a0) - BMXDKPBA initialized
 
-		/* These nops here are MANDATORY. And exactly this many.
-		 * Less it doesn't work, more it doesn't work. */
-		neofoxx_xferInstruction(a, 0x0C000C00);
-		neofoxx_xferInstruction(a, 0x0C000C00);
+		    /* Step 3. */
+		    neofoxx_xferInstruction_PC_slow(a, 0x8c850040);    // lw  a1, 64(a0) - load BMXDMSZ
+		    neofoxx_xferInstruction_PC_slow(a, 0xac850020);    // sw  a1, 32(a0) - BMXDUDBA initialized
+		    neofoxx_xferInstruction_PC_slow(a, 0xac850030);    // sw  a1, 48(a0) - BMXDUPBA initialized
 
-		// Step 4. Load the PE using the PE_loader
-		// Switch to ETAP
-		neofoxx_sendCommand(a, TAP_SW_ETAP, 1);
-		/* TMS 1-1-1-1-1-0 */
-		neofoxx_setMode(a, SET_MODE_TAP_RESET, 1);
-		// Set to FASTDATA
-		neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+		    /* Step 4. */
+		    neofoxx_xferInstruction_PC_slow(a, 0x3c04a000);    // lui a0, 0xa000
+		    neofoxx_xferInstruction_PC_slow(a, 0x34840800);    // ori a0, 0x800  - a0 has a0000800
 
-		// Send PE_ADDRESS, Address os PE program block from PE Hex file
-		neofoxx_xferFastData(a, 0xA0000300, 0, 1);	// Taken from the .hex file.
+		    /* Download the PE loader. */
+		    int i;
+		    for (i=0; i<PIC32_PE_LOADER_LEN; i+=2) {
+		        /* Step 5. */
+		        unsigned opcode1 = 0x3c060000 | pic32_pe_loader[i];
+		        unsigned opcode2 = 0x34c60000 | pic32_pe_loader[i+1];
+
+		        neofoxx_xferInstruction_PC_slow(a, opcode1);       // lui a2, PE_loader_hi++
+		        neofoxx_xferInstruction_PC_slow(a, opcode2);       // ori a2, PE_loader_lo++
+		        neofoxx_xferInstruction_PC_slow(a, 0xac860000);    // sw  a2, 0(a0)
+		        neofoxx_xferInstruction_PC_slow(a, 0x24840004);    // addiu a0, 4
+		    }
+
+		    /* Jump to PE loader (step 6). */
+		    neofoxx_xferInstruction_PC_slow(a, 0x3c19a000);    // lui t9, 0xa000
+		    neofoxx_xferInstruction_PC_slow(a, 0x37390800);    // ori t9, 0x800  - t9 has a0000800
+		    neofoxx_xferInstruction_PC_slow(a, 0x03200008);    // jr  t9
+		    neofoxx_xferInstruction_PC_slow(a, 0x00000000);    // nop
+
+		    /* Switch from serial to fast execution mode. */
+		    neofoxx_sendCommand(a, TAP_SW_ETAP, 1);
+		    /* TMS 1-1-1-1-1-0 */
+		    neofoxx_setMode(a, SET_MODE_TAP_RESET, 1);
+
+		    /* Send parameters for the loader (step 7-A).
+		     * PE_ADDRESS = 0xA000_0900,
+		     * PE_SIZE */
+		    /* Send command. */
+		    neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+		    neofoxx_xferFastData_PC_slow(a, 0xa0000900, 0);    /* Don't read, immediate */
+		    neofoxx_xferFastData_PC_slow(a, nwords, 0);        /* Don't read, immediate */
+
+		    /* Download the PE itself (step 7-B). */
+		    if (debug_level > 0)
+		        fprintf(stderr, "%s: download PE\n", a->name);
+		    for (i=0; i<nwords; i++) {
+		        neofoxx_xferFastData_PC_slow(a, *pe++, 0);     /* Don't read, not immediate */
+		    }
+		    neofoxx_flush_output(a);
+		    mdelay(10);
+
+		    /* Download the PE instructions. */
+		    /* Step 8 - jump to PE. */
+		    neofoxx_xferFastData_PC_slow(a, 0, 0);             /* Don't read, immediate */                  
+		    neofoxx_xferFastData_PC_slow(a, 0xDEAD0000, 0);    /* Don't read, immediate */
+		    mdelay(10);
+		    neofoxx_xferFastData_PC_slow(a, PE_EXEC_VERSION << 16, 0); /* Don't read, immediate */
+		}
+		else{
+		    /* Else MM family */
+		    // Step 1. Setup PIC32MM RAM address for the PE 
+			neofoxx_xferInstruction_PC_slow(a, 0xa00041a4);    // lui a0, 0xa000
+			neofoxx_xferInstruction_PC_slow(a, 0x02005084);    // ori a0, a0, 0x200 A total of 0xa000_0200
+
+			// Step 2. Load the PE_loader.
+			int i;
+			for (i=0; i<PIC32_PEMM_LOADER_LEN; i+=2) {
+				/* Step 5. */
+				unsigned opcode1 = 0x41A6 | (pic32_pemm_loader[i] << 16);
+				unsigned opcode2 = 0x50C6 | (pic32_pemm_loader[i+1] << 16);
+
+				neofoxx_xferInstruction_PC_slow(a, opcode1);       // lui a2, PE_loader_hi++
+				neofoxx_xferInstruction_PC_slow(a, opcode2);       // ori a2, a2, PE_loader_lo++
+				neofoxx_xferInstruction_PC_slow(a, 0x6E42EB40);    // sw  a2, 0(a0); addiu a0, a0, 4;
+			}
+
+			// Step 3. Jump to the PE_Loader
+			neofoxx_xferInstruction_PC_slow(a, 0xA00041B9);       // lui t9, 0xa000
+			neofoxx_xferInstruction_PC_slow(a, 0x02015339);       // ori t9, t9, 0x0800. Same address as at beginning +1.
+			neofoxx_xferInstruction_PC_slow(a, 0x0C004599);       // jr t9; nop;
+
+			/* These nops here are MANDATORY. And exactly this many.
+			 * Less it doesn't work, more it doesn't work. */
+			neofoxx_xferInstruction_PC_slow(a, 0x0C000C00);
+			neofoxx_xferInstruction_PC_slow(a, 0x0C000C00);
+
+			// Step 4. Load the PE using the PE_loader
+			// Switch to ETAP
+			neofoxx_sendCommand(a, TAP_SW_ETAP, 1);
+			/* TMS 1-1-1-1-1-0 */
+			neofoxx_setMode(a, SET_MODE_TAP_RESET, 1);
+			// Set to FASTDATA
+			neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+
+			// Send PE_ADDRESS, Address os PE program block from PE Hex file
+			neofoxx_xferFastData_PC_slow(a, 0xA0000300, 0);	// Taken from the .hex file.
+			
+			// Send PE_SIZE, number as 32-bit words of the program block from the PE Hex file
+			neofoxx_xferFastData_PC_slow(a, nwords, 0);        // Data, don't read
+
+			if (debug_level > 0){
+				fprintf(stderr, "%s: download PE, nwords = %d\n", a->name, nwords);
+				//mdelay(3000);		
+			}
+			for (i=0; i<nwords; i++) {
+				neofoxx_xferFastData_PC_slow(a, *pe++, 0);     // Data, don't read
+			}
+			neofoxx_flush_output(a);
+			mdelay(10);
+
+			// Step 5, Jump to the PE.
+			neofoxx_xferFastData_PC_slow(a, 0x00000000, 0);
+			neofoxx_xferFastData_PC_slow(a, 0xDEAD0000, 0);
+
+			// Done.
+			// Get PE version?
+			mdelay(10);
+			neofoxx_xferFastData_PC_slow(a, PE_EXEC_VERSION << 16, 0);     // Data, don't read
+		}
 		
-		// Send PE_SIZE, number as 32-bit words of the program block from the PE Hex file
-		neofoxx_xferFastData(a, nwords, 0, 1);        // Data, don't read, immediate (wasn't before)
-
+		unsigned version = get_pe_response(a);
+		if (version != (PE_EXEC_VERSION << 16 | pe_version)) {
+		    fprintf(stderr, "%s: bad PE version = %08x, expected %08x\n",
+		        a->name, version, PE_EXEC_VERSION << 16 | pe_version);
+		    exit(-1);
+		}
 		if (debug_level > 0){
-			fprintf(stderr, "%s: download PE, nwords = %d\n", a->name, nwords);
-			//mdelay(3000);		
+		    fprintf(stderr, "%s: PE version = %04x\n", a->name, version & 0xffff);
 		}
-		for (i=0; i<nwords; i++) {
-			neofoxx_xferFastData(a, *pe++, 0, 0);     // Data, don't read, no immediate
-		}
-		neofoxx_flush_output(a);
-		mdelay(10);
-
-		// Step 5, Jump to the PE.
-		neofoxx_xferFastData(a, 0x00000000, 0, 1);
-		neofoxx_xferFastData(a, 0xDEAD0000, 0, 1);
-
-		// Done.
-		// Get PE version?
-		mdelay(10);
-		neofoxx_xferFastData(a, PE_EXEC_VERSION << 16, 0, 1);     // Data, don't read, immediate (wasn't before)
-    }
-    
-    unsigned version = get_pe_response(a);
-    if (version != (PE_EXEC_VERSION << 16 | pe_version)) {
-        fprintf(stderr, "%s: bad PE version = %08x, expected %08x\n",
-            a->name, version, PE_EXEC_VERSION << 16 | pe_version);
-        exit(-1);
-    }
-    if (debug_level > 0)
-        fprintf(stderr, "%s: PE version = %04x\n",
-            a->name, version & 0xffff);
+	}	
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+	}
 }
 
 /*
@@ -1122,6 +1201,7 @@ static void neofoxx_program_word(adapter_t *adapter,
     unsigned addr, unsigned word)
 {
     neofoxx_adapter_t *a = (neofoxx_adapter_t*) adapter;
+	uint32_t workaround = 1;
 
     if (FAMILY_MM == a->adapter.family_name_short){
         fprintf(stderr, "Program word is not available on MM family. Quitting\n");
@@ -1135,24 +1215,33 @@ static void neofoxx_program_word(adapter_t *adapter,
         exit(-1);
     }
 
-    /* Use PE to write flash memory. */
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+	if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
+		/* Use PE to write flash memory. */
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
 
-    neofoxx_xferFastData(a, PE_WORD_PROGRAM << 16 | 2, 0, 1); // Data, don't read, immediate
-    neofoxx_xferFastData(a, addr, 0, 1);  /* Send address. */ // Data, don't read, immediate
-    neofoxx_xferFastData(a, word, 0, 1);  /* Send word. */    // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, PE_WORD_PROGRAM << 16 | 2, 0); // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, addr, 0);  /* Send address. */ // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, word, 0);  /* Send word. */    // Data, don't read, immediate
 
-    unsigned response = get_pe_response(a);
-    if (response != (PE_WORD_PROGRAM << 16)) {
-        fprintf(stderr, "%s: failed to program word %08x at %08x, reply = %08x\n",
-            a->name, word, addr, response);
-        exit(-1);
-    }
+		unsigned response = get_pe_response(a);
+		if (response != (PE_WORD_PROGRAM << 16)) {
+		    fprintf(stderr, "%s: failed to program word %08x at %08x, reply = %08x\n",
+		        a->name, word, addr, response);
+		    exit(-1);
+		}
+	}
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+	}
 }
 
 static void neofoxx_program_double_word(adapter_t *adapter, unsigned addr, unsigned word0, unsigned word1){
     neofoxx_adapter_t *a = (neofoxx_adapter_t*) adapter;
+	uint32_t workaround = 1;
     
     if (FAMILY_MM != a->adapter.family_name_short){
         fprintf(stderr, "Program double word is only available on MM family. Quitting\n");
@@ -1167,27 +1256,36 @@ static void neofoxx_program_double_word(adapter_t *adapter, unsigned addr, unsig
         exit(-1);
     }
 
-	 /* Use PE to write flash memory. */
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
-    // TODO - RECHECK the | 2!!!
-    neofoxx_xferFastData(a, PE_DOUBLE_WORD_PGRM << 16 | 2, 0, 1); // Data, don't read, immediate
-    neofoxx_xferFastData(a, addr, 0, 1);  	/* Send address. */ // Data, don't read, immediate
-    neofoxx_xferFastData(a, word0, 0, 1);  	/* Send 1st word. */    // Data, don't read, immediate, was not before
-    neofoxx_xferFastData(a, word1, 0, 1);  	/* Send 2nd word. */    // Data, don't read, immediate, was not before
- 
-    unsigned response = get_pe_response(a);
-    if (response != (PE_DOUBLE_WORD_PGRM << 16)) {
-        fprintf(stderr, "%s: failed to program double words 0x%08x 0x%08x at 0x%08x, reply = %08x\n",
-            a->name, word0, word1, addr, response);
-        exit(-1);
-    }
-	
+	if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
+		/* Use PE to write flash memory. */
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+		// TODO - RECHECK the | 2!!!
+		neofoxx_xferFastData_PC_slow(a, PE_DOUBLE_WORD_PGRM << 16 | 2, 0); // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, addr, 0);  	/* Send address. */ // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, word0, 0);  	/* Send 1st word. */    // Data, don't read, immediate, was not before
+		neofoxx_xferFastData_PC_slow(a, word1, 0);  	/* Send 2nd word. */    // Data, don't read, immediate, was not before
+	 
+		unsigned response = get_pe_response(a);
+		if (response != (PE_DOUBLE_WORD_PGRM << 16)) {
+		    fprintf(stderr, "%s: failed to program double words 0x%08x 0x%08x at 0x%08x, reply = %08x\n",
+		        a->name, word0, word1, addr, response);
+		    exit(-1);
+		}
+	}	
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+	}
+
 }
 
 static void neofoxx_program_quad_word(adapter_t *adapter, unsigned addr, 
             unsigned word0, unsigned word1, unsigned word2, unsigned word3){
     neofoxx_adapter_t *a = (neofoxx_adapter_t*) adapter;
+	uint32_t workaround = 1;
 
     if (FAMILY_MK != a->adapter.family_name_short
         && FAMILY_MZ != a->adapter.family_name_short){
@@ -1204,23 +1302,32 @@ static void neofoxx_program_quad_word(adapter_t *adapter, unsigned addr,
         exit(-1);
     }
 
-	 /* Use PE to write flash memory. */
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+	if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
 
-    neofoxx_xferFastData(a, PE_QUAD_WORD_PGRM << 16, 0, 1); // Data, don't read, immediate
-    neofoxx_xferFastData(a, addr, 0, 1);  	/* Send address. */ // Data, don't read, immediate
-    neofoxx_xferFastData(a, word0, 0, 1);  	/* Send 1st word. */    // Data, don't read, immediate, was not before
-    neofoxx_xferFastData(a, word1, 0, 1);  	/* Send 2nd word. */    // Data, don't read, immediate, was not before
-    neofoxx_xferFastData(a, word2, 0, 1);  	/* Send 1st word. */    // Data, don't read, immediate, was not before
-    neofoxx_xferFastData(a, word3, 0, 1);  	/* Send 2nd word. */    // Data, don't read, immediate, was not before
- 
-    unsigned response = get_pe_response(a);
-    if (response != (PE_QUAD_WORD_PGRM << 16)) {
-        fprintf(stderr, "%s: failed to program quad words 0x%08x 0x%08x 0x%08x 0x%08x at 0x%08x, reply = %08x\n",
-            a->name, word0, word1, word2, word3, addr, response);
-        exit(-1);
-    }
+		/* Use PE to write flash memory. */
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+
+		neofoxx_xferFastData_PC_slow(a, PE_QUAD_WORD_PGRM << 16, 0); // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, addr, 0);  	/* Send address. */ // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, word0, 0);  	/* Send 1st word. */    // Data, don't read, immediate, was not before
+		neofoxx_xferFastData_PC_slow(a, word1, 0);  	/* Send 2nd word. */    // Data, don't read, immediate, was not before
+		neofoxx_xferFastData_PC_slow(a, word2, 0);  	/* Send 1st word. */    // Data, don't read, immediate, was not before
+		neofoxx_xferFastData_PC_slow(a, word3, 0);  	/* Send 2nd word. */    // Data, don't read, immediate, was not before
+
+		unsigned response = get_pe_response(a);
+		if (response != (PE_QUAD_WORD_PGRM << 16)) {
+			fprintf(stderr, "%s: failed to program quad words 0x%08x 0x%08x 0x%08x 0x%08x at 0x%08x, reply = %08x\n",
+				a->name, word0, word1, word2, word3, addr, response);
+			exit(-1);
+		}
+	}
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+	}
 	
 }
 
@@ -1232,6 +1339,7 @@ static void neofoxx_program_row(adapter_t *adapter, unsigned addr,
 {
     neofoxx_adapter_t *a = (neofoxx_adapter_t*) adapter;
     int i;
+	uint32_t workaround = 0;
 
     if (debug_level > 0)
         fprintf(stderr, "%s: row program %u words at %08x\n",
@@ -1242,27 +1350,66 @@ static void neofoxx_program_row(adapter_t *adapter, unsigned addr,
         exit(-1);
     }
 
-    /* Use PE to write flash memory. */
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_FASTDATA, 1); 
+	if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
 
-    neofoxx_xferFastData(a, PE_ROW_PROGRAM << 16 | words_per_row, 0, 1);  // Data, don't read, immediate
-    neofoxx_xferFastData(a, addr, 0, 1);  /* Send address. */             // Data, don't read, immediate
+		/* Use PE to write flash memory. */
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_FASTDATA, 1); 
 
-    /* Download data. */
-    for (i = 0; i < words_per_row; i++) {
-        if ((i & 7) == 0)
-            neofoxx_flush_output(a);
-        neofoxx_xferFastData(a, *data++, 0, 0);   /* Send word. Don't read, not immediate */
-    }
-    neofoxx_flush_output(a);
+		neofoxx_xferFastData_PC_slow(a, PE_ROW_PROGRAM << 16 | words_per_row, 0);  // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, addr, 0);  /* Send address. */             // Data, don't read, immediate
 
-    unsigned response = get_pe_response(a);
-    if (response != (PE_ROW_PROGRAM << 16)) {
-        fprintf(stderr, "%s: failed to program row at %08x, reply = %08x\n",
-            a->name, addr, response);
-        exit(-1);
-    }
+		/* Download data. */
+		for (i = 0; i < words_per_row; i++) {
+		    if ((i & 7) == 0)
+		        neofoxx_flush_output(a);
+		    neofoxx_xferFastData_PC_slow(a, *data++, 0);   /* Send word. Don't read, not immediate */
+		}
+		neofoxx_flush_output(a);
+
+		unsigned response = get_pe_response(a);
+		if (response != (PE_ROW_PROGRAM << 16)) {
+		    fprintf(stderr, "%s: failed to program row at %08x, reply = %08x\n",
+		        a->name, addr, response);
+		    exit(-1);
+		}
+	}
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+		/* Use PE to write flash memory. */
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_FASTDATA, 1); 
+		neofoxx_xferFastData_MCU_fast(a, PE_ROW_PROGRAM << 16 | words_per_row, 0);	
+		neofoxx_xferFastData_MCU_fast(a, addr, 0);  // Send address
+		
+		neofoxx_flush_output(a);
+
+		// Download data
+		for (i = 0; i < words_per_row; i++) {
+		    if ((i & 3) == 0){
+		        neofoxx_flush_output(a);	// Send data every x bytes.
+			}
+			///fprintf(stderr, "Sending %08x\n", *data);
+		    neofoxx_xferFastData_MCU_fast(a, *data++, 0);
+		}
+
+		neofoxx_flush_output(a);	// At this point, all data will be sent.
+		///mdelay(1000);
+		///fprintf(stderr, "getting PE response\n");
+		///mdelay(7500);
+
+
+		unsigned response = get_pe_response(a);
+		if (response != (PE_ROW_PROGRAM << 16)) {
+		    fprintf(stderr, "%s: failed to program row at %08x, reply = %08x\n",
+		        a->name, addr, response);
+		    exit(-1);
+		}
+
+	}
 }
 
 /*
@@ -1273,6 +1420,7 @@ static void neofoxx_verify_data(adapter_t *adapter,
 {
     neofoxx_adapter_t *a = (neofoxx_adapter_t*) adapter;
     unsigned data_crc, flash_crc;
+	uint32_t workaround = 1;
 
     //fprintf(stderr, "%s: verify %d words at %08x\n", a->name, nwords, addr);
     if (! a->use_executive) {
@@ -1281,29 +1429,38 @@ static void neofoxx_verify_data(adapter_t *adapter,
         exit(-1);
     }
 
-    /* Use PE to get CRC of flash memory. */
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
+	if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
+    	/* Use PE to get CRC of flash memory. */
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_FASTDATA, 1);
 
-    neofoxx_xferFastData(a, PE_GET_CRC << 16, 0, 1);  // Data, don't read, immediate
-     /* Send address. */
-    neofoxx_xferFastData(a, addr, 0, 1);              // Data, don't read, immediate
-    /* Send length. */
-    neofoxx_xferFastData(a, nwords * 4, 0, 1);        // Data, don't read, immediate
+		neofoxx_xferFastData_PC_slow(a, PE_GET_CRC << 16, 0);  // Data, don't read, immediate
+		 /* Send address. */
+		neofoxx_xferFastData_PC_slow(a, addr, 0);              // Data, don't read, immediate
+		/* Send length. */
+		neofoxx_xferFastData_PC_slow(a, nwords * 4, 0);        // Data, don't read, immediate
 
-    unsigned response = get_pe_response(a);
-    if (response != (PE_GET_CRC << 16)) {
-        fprintf(stderr, "%s: failed to verify %d words at %08x, reply = %08x\n",
-            a->name, nwords, addr, response);
-        exit(-1);
-    }
-    flash_crc = get_pe_response(a) & 0xffff;
-    data_crc = calculate_crc(0xffff, (unsigned char*) data, nwords * 4);
-    if (flash_crc != data_crc) {
-        fprintf(stderr, "%s: checksum failed at %08x: sum=%04x, expected=%04x\n",
-            a->name, addr, flash_crc, data_crc);
-        //exit(-1);
-    }
+		unsigned response = get_pe_response(a);
+		if (response != (PE_GET_CRC << 16)) {
+		    fprintf(stderr, "%s: failed to verify %d words at %08x, reply = %08x\n",
+		        a->name, nwords, addr, response);
+		    exit(-1);
+		}
+		flash_crc = get_pe_response(a) & 0xffff;
+		data_crc = calculate_crc(0xffff, (unsigned char*) data, nwords * 4);
+		if (flash_crc != data_crc) {
+		    fprintf(stderr, "%s: checksum failed at %08x: sum=%04x, expected=%04x\n",
+		        a->name, addr, flash_crc, data_crc);
+		    //exit(-1);
+		}
+
+	}
+	else{
+		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+	}
 }
 
 /*
@@ -1363,6 +1520,15 @@ adapter_t *adapter_open_neofoxx(const char *port, int baudrate, int interface, i
 
 
     /* By default, use 500 kHz speed, unless specified */
+	
+	if (0 != speed){
+		fprintf(stderr, "Using NEW WAY of communicating\n");
+		a->way = WAY_NEW;
+	}
+	else{
+		fprintf(stderr, "Using old way of communicating\n");
+		a->way = WAY_OLD;
+	}
     neofoxx_speed(a, speed);
 	// TODO prinout what's the actual frequency
 
