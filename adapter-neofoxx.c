@@ -31,7 +31,7 @@ typedef struct {
 	char name [64];	// Make const char * again later or something.	
 
     // Transmit buffer
-    uint8_t output [2048];
+    uint8_t output [2048];	// TODO - change to match actual MCU code.
     int bytes_to_write;
 
     // Receive buffer.
@@ -1550,14 +1550,19 @@ adapter_t *adapter_open_neofoxx(const char *port, int baudrate, int interface, i
         /* Reset the JTAG TAP controller: TMS 1-1-1-1-1-0.
          * After reset, the IDCODE register is always selected.
          * Read out 32 bits of data. */
-        
+        fprintf(stderr, "aaaa\n");
 
         neofoxx_setMode(a, SET_MODE_TAP_RESET, 1);
+fprintf(stderr, "bbbb\n");
         neofoxx_sendCommand(a, TAP_SW_MTAP, 1);
+fprintf(stderr, "cccc\n");
         neofoxx_setMode(a, SET_MODE_TAP_RESET, 1);
+fprintf(stderr, "dddd\n");
         neofoxx_sendCommand(a, MTAP_IDCODE, 1);
+fprintf(stderr, "eeee\n");
 
         idcode = neofoxx_xferData(a, 32, 0, 1, 1);
+fprintf(stderr, "ffff\n");
         if ((idcode & 0xfff) != 0x053) {
             /* Microchip vendor ID is expected. */
             if (debug_level > 0 || (idcode != 0 && idcode != 0xffffffff))
