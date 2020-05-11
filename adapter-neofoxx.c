@@ -86,6 +86,8 @@ typedef struct {
 #define COMMAND_SET_PIN_READ	5	// Read pin value
 #define COMMAND_SEND			6	// Send command
 #define COMMAND_XFER_INSTRUCTION	7	// xferInstruction, but performed on MCU
+#define COMMAND_GET_PE_RESPONSE		8	// get_pe_response, but performed on MCU
+
 
 #define PROG_MODE_TRISTATE	0
 #define PROG_MODE_JTAG		1
@@ -227,6 +229,10 @@ static void neofoxx_flush_output(neofoxx_adapter_t *a)
 
     if (a->bytes_to_write <= 0){
         return;
+	}
+
+	if (debug_level > 1){
+		fprintf(stderr, "Writing %d bytes\n", a->bytes_to_write);
 	}
 
 	// Write what we have to write
@@ -835,34 +841,63 @@ static unsigned get_pe_response(neofoxx_adapter_t *a)
 {
     unsigned ctl, response;
 
-    // Select Control Register
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_CONTROL, 1);	// Command, immediate
 
-    // Wait until CPU is ready
-    // Check if Processor Access bit (bit 18) is set
-    do {
-        ctl = neofoxx_xferData(a, 32, (CONTROL_PRACC | CONTROL_PROBEN 
-                | CONTROL_PROBTRAP | CONTROL_EJTAGBRK), 1, 1);    // Send data, readflag, immediate don't care
-    } while (! (ctl & CONTROL_PRACC));
+	// This functions takes quite a bit of time, since going back & forth
+	// Always consumes 1ms per direction.
+	uint32_t workaround = 0;
 
-    // Select Data Register
-    // Send the instruction
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_DATA, 1);
+	if (WAY_OLD == a->way || workaround){
+		if (workaround){
+			fprintf(stderr, "WORKAROUND in %s active\n", __func__); 
+		}
+		// Select Control Register
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_CONTROL, 1);	// Command, immediate
 
-    /* Get data. */
-    response = neofoxx_xferData(a, 32, 0, 1, 1);  // Send 32 zeroes, read response, immediate don't care
+		// Wait until CPU is ready
+		// Check if Processor Access bit (bit 18) is set
+		do {
+		    ctl = neofoxx_xferData(a, 32, (CONTROL_PRACC | CONTROL_PROBEN 
+		            | CONTROL_PROBTRAP | CONTROL_EJTAGBRK), 1, 1);    // Send data, readflag, immediate don't care
+		} while (! (ctl & CONTROL_PRACC));
 
-    // Tell CPU to execute NOP instruction
-    /* Send command. */
-    neofoxx_sendCommand(a, ETAP_CONTROL, 1);
-    /* Send data. */
-    neofoxx_xferData(a, 32, (CONTROL_PROBEN | CONTROL_PROBTRAP), 0, 1);
+		// Select Data Register
+		// Send the instruction
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_DATA, 1);
 
-    if (debug_level > 1)
-        fprintf(stderr, "%s: get PE response %08x\n", a->name, response);
-    return response;
+		/* Get data. */
+		response = neofoxx_xferData(a, 32, 0, 1, 1);  // Send 32 zeroes, read response, immediate don't care
+
+		// Tell CPU to execute NOP instruction
+		/* Send command. */
+		neofoxx_sendCommand(a, ETAP_CONTROL, 1);
+		/* Send data. */
+		neofoxx_xferData(a, 32, (CONTROL_PROBEN | CONTROL_PROBTRAP), 0, 1);
+
+	}
+	else{
+		uint8_t data[1];	// Just the command
+		uint32_t nbytes = 0;
+		data[nbytes++] = COMMAND_GET_PE_RESPONSE;
+
+		add_to_packet(a, data, nbytes);
+		a->bytes_to_read = a->bytes_to_read + sizeof(uint64_t);	// Important!
+
+		uint64_t temp = neofoxx_recv(a);	// Flushes and receives one 64-bit reply
+		if (temp & 0x8000000000000000){
+			fprintf(stderr, "get_pe_response error on mcu side\n");
+		}		
+		// Get lower 32-bits, and save them
+		response = (uint32_t)(temp & 0xFFFFFFFF);
+
+	}
+
+	if (debug_level > 1){
+		fprintf(stderr, "%s: get PE response %08x\n", a->name, response);
+	}
+	return response;
+
 }
 
 /*
@@ -1156,6 +1191,7 @@ static void neofoxx_load_executive(adapter_t *adapter,
 	else{
 		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
 	}
+
 }
 
 /*
@@ -1378,7 +1414,7 @@ static void neofoxx_program_row(adapter_t *adapter, unsigned addr,
 		}
 	}
 	else{
-		fprintf(stderr, "WAY_NEW not implemented yet in %s\n", __func__);
+		fprintf(stderr, "WAY_NEW sort of implemented in %s\n", __func__);
 		/* Use PE to write flash memory. */
 		/* Send command. */
 		neofoxx_sendCommand(a, ETAP_FASTDATA, 1); 
@@ -1408,7 +1444,6 @@ static void neofoxx_program_row(adapter_t *adapter, unsigned addr,
 		        a->name, addr, response);
 		    exit(-1);
 		}
-
 	}
 }
 
